@@ -5,11 +5,20 @@ use std::collections::VecDeque;
 /// pendingBaseQueue
 pub(crate) type PendingBaseQueue = VecDeque<ChunkPayloadData>;
 
+/// Identifies a queued fragment even when its SID, SSN and timestamp are reused.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct PendingPosition {
+    unordered: bool,
+    position: u64,
+}
+
 /// pendingQueue
 #[derive(Debug, Default)]
 pub(crate) struct PendingQueue {
     unordered_queue: PendingBaseQueue,
     ordered_queue: PendingBaseQueue,
+    ordered_popped: u64,
+    unordered_popped: u64,
     queue_len: usize,
     n_bytes: usize,
     selected: bool,
@@ -47,6 +56,39 @@ impl PendingQueue {
         }
 
         self.ordered_queue.front()
+    }
+
+    pub(crate) fn front_position(&self) -> Option<PendingPosition> {
+        let unordered = self.peek()?.unordered;
+        Some(PendingPosition {
+            unordered,
+            position: if unordered {
+                self.unordered_popped
+            } else {
+                self.ordered_popped
+            },
+        })
+    }
+
+    /// Remove the rest of this message once. A repeated call cannot consume
+    /// the next message, even when it has the same stream and policy metadata.
+    pub(crate) fn drain_message(&mut self, position: PendingPosition) -> Vec<ChunkPayloadData> {
+        if self.front_position() != Some(position) {
+            return vec![];
+        }
+        let mut chunks = vec![];
+        loop {
+            let c = self
+                .peek()
+                .expect("pending message must have an ending fragment");
+            let c = self.pop(c.beginning_fragment, c.unordered).unwrap();
+            let last = c.ending_fragment;
+            chunks.push(c);
+            if last {
+                break;
+            }
+        }
+        chunks
     }
 
     pub(crate) fn pop(
@@ -94,6 +136,11 @@ impl PendingQueue {
         if let Some(p) = &popped {
             self.n_bytes -= p.user_data.len();
             self.queue_len -= 1;
+            if p.unordered {
+                self.unordered_popped += 1;
+            } else {
+                self.ordered_popped += 1;
+            }
         }
 
         popped
