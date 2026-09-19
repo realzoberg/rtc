@@ -1,4 +1,5 @@
 use crate::chunk::chunk_payload_data::ChunkPayloadData;
+use shared::error::{Error, Result};
 
 use std::collections::VecDeque;
 
@@ -72,23 +73,66 @@ impl PendingQueue {
 
     /// Remove the rest of this message once. A repeated call cannot consume
     /// the next message, even when it has the same stream and policy metadata.
-    pub(crate) fn drain_message(&mut self, position: PendingPosition) -> Vec<ChunkPayloadData> {
+    pub(crate) fn drain_message(
+        &mut self,
+        position: PendingPosition,
+    ) -> Result<Vec<ChunkPayloadData>> {
         if self.front_position() != Some(position) {
-            return vec![];
+            return Ok(vec![]);
         }
-        let mut chunks = vec![];
-        loop {
-            let c = self
-                .peek()
-                .expect("pending message must have an ending fragment");
-            let c = self.pop(c.beginning_fragment, c.unordered).unwrap();
-            let last = c.ending_fragment;
-            chunks.push(c);
-            if last {
+        let queue = if position.unordered {
+            &mut self.unordered_queue
+        } else {
+            &mut self.ordered_queue
+        };
+        let Some(first) = queue.front() else {
+            return Err(Error::OtherSctpErr("missing pending message".into()));
+        };
+        if !self.selected && !first.beginning_fragment {
+            return Err(Error::OtherSctpErr(
+                "missing pending message beginning".into(),
+            ));
+        }
+
+        // Validate the complete tail before removing anything. In particular,
+        // a missing E bit must not consume the next message's beginning.
+        let mut bytes = 0;
+        let mut count = None;
+        for (i, c) in queue.iter().enumerate() {
+            if (i != 0 && c.beginning_fragment)
+                || c.stream_identifier != first.stream_identifier
+                || c.stream_sequence_number != first.stream_sequence_number
+                || c.stream_generation != first.stream_generation
+                || c.unordered != position.unordered
+            {
+                return Err(Error::OtherSctpErr(
+                    "invalid pending message fragments".into(),
+                ));
+            }
+            bytes += c.user_data.len();
+            if c.ending_fragment {
+                count = Some(i + 1);
                 break;
             }
         }
-        chunks
+        let count = count
+            .ok_or_else(|| Error::OtherSctpErr("pending message has no ending fragment".into()))?;
+        if count > self.queue_len || bytes > self.n_bytes {
+            return Err(Error::OtherSctpErr(
+                "invalid pending message accounting".into(),
+            ));
+        }
+
+        let chunks = queue.drain(..count).collect();
+        self.queue_len -= count;
+        self.n_bytes -= bytes;
+        if position.unordered {
+            self.unordered_popped = self.unordered_popped.wrapping_add(count as u64);
+        } else {
+            self.ordered_popped = self.ordered_popped.wrapping_add(count as u64);
+        }
+        self.selected = false;
+        Ok(chunks)
     }
 
     pub(crate) fn pop(
@@ -137,9 +181,9 @@ impl PendingQueue {
             self.n_bytes -= p.user_data.len();
             self.queue_len -= 1;
             if p.unordered {
-                self.unordered_popped += 1;
+                self.unordered_popped = self.unordered_popped.wrapping_add(1);
             } else {
-                self.ordered_popped += 1;
+                self.ordered_popped = self.ordered_popped.wrapping_add(1);
             }
         }
 
@@ -156,5 +200,73 @@ impl PendingQueue {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    fn fragment(beginning: bool, ending: bool, unordered: bool) -> ChunkPayloadData {
+        ChunkPayloadData {
+            beginning_fragment: beginning,
+            ending_fragment: ending,
+            unordered,
+            user_data: Bytes::from_static(b"data"),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn invalid_message_drain_preserves_fragments_and_accounting() {
+        for unordered in [false, true] {
+            for next_message in [false, true] {
+                let mut queue = PendingQueue::new();
+                queue.push(fragment(true, false, unordered));
+                queue.push(fragment(false, false, unordered));
+                if next_message {
+                    // Same SID/SSN: only the B bit distinguishes this message.
+                    queue.push(fragment(true, true, unordered));
+                }
+                let position = queue.front_position().unwrap();
+                let (len, bytes) = (queue.len(), queue.get_num_bytes());
+                assert!(queue.drain_message(position).is_err());
+                assert_eq!(Some(position), queue.front_position());
+                assert_eq!(len, queue.len());
+                assert_eq!(bytes, queue.get_num_bytes());
+                assert!(!queue.selected);
+            }
+        }
+    }
+
+    #[test]
+    fn missing_beginning_is_an_error_without_mutation() {
+        let mut queue = PendingQueue::new();
+        queue.push(fragment(false, true, false));
+        let position = queue.front_position().unwrap();
+        assert!(queue.drain_message(position).is_err());
+        assert_eq!(Some(position), queue.front_position());
+        assert_eq!(1, queue.len());
+        assert_eq!(4, queue.get_num_bytes());
+    }
+
+    #[test]
+    fn draining_selected_tail_preserves_other_queue_and_is_idempotent() -> Result<()> {
+        for unordered in [false, true] {
+            let mut queue = PendingQueue::new();
+            queue.push(fragment(true, false, unordered));
+            queue.push(fragment(false, true, unordered));
+            assert!(queue.pop(true, unordered).is_some());
+            queue.push(fragment(true, true, !unordered));
+            let position = queue.front_position().unwrap();
+            assert_eq!(1, queue.drain_message(position)?.len());
+            assert!(queue.drain_message(position)?.is_empty());
+            assert!(!queue.selected);
+            assert_eq!(1, queue.len());
+            assert_eq!(4, queue.get_num_bytes());
+            assert_eq!(!unordered, queue.peek().unwrap().unordered);
+        }
+        Ok(())
     }
 }

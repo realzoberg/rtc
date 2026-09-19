@@ -19,6 +19,10 @@ pub(crate) struct PayloadQueue {
     pub(crate) sorted: VecDeque<u32>,
     dup_tsn: Vec<u32>,
     n_bytes: usize,
+    #[cfg(test)]
+    pub(crate) track_lookups: bool,
+    #[cfg(test)]
+    pub(crate) lookups: std::cell::Cell<usize>,
 }
 
 impl PayloadQueue {
@@ -82,9 +86,17 @@ impl PayloadQueue {
 
     /// get returns reference to chunkPayloadData with the given TSN value.
     pub(crate) fn get(&self, tsn: u32) -> Option<&ChunkPayloadData> {
+        #[cfg(test)]
+        if self.track_lookups {
+            self.lookups.set(self.lookups.get() + 1);
+        }
         self.chunk_map.get(&tsn)
     }
     pub(crate) fn get_mut(&mut self, tsn: u32) -> Option<&mut ChunkPayloadData> {
+        #[cfg(test)]
+        if self.track_lookups {
+            self.lookups.set(self.lookups.get() + 1);
+        }
         self.chunk_map.get_mut(&tsn)
     }
 

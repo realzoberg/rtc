@@ -68,6 +68,7 @@ pub(crate) struct TimerTable {
     data: [Option<Instant>; TIMER_COUNT],
     retrans: [usize; TIMER_COUNT],
     max_retrans: [usize; TIMER_COUNT],
+    shutdown_interval: Option<u64>,
     reconfig_interval: Option<u64>,
 }
 
@@ -98,13 +99,23 @@ impl TimerTable {
         self.data.iter().filter_map(|&x| x).min()
     }
 
+    fn control_interval(&mut self, timer: Timer) -> Option<&mut Option<u64>> {
+        match timer {
+            Timer::T2Shutdown => Some(&mut self.shutdown_interval),
+            Timer::Reconfig => Some(&mut self.reconfig_interval),
+            _ => None,
+        }
+    }
+
     pub fn start(&mut self, timer: Timer, now: Instant, interval: u64) {
         // T3 uses the destination's current RTO, which already includes backoff.
         // Successful DATA acknowledgments reset its error counter independently.
-        let interval = if timer == Timer::Reconfig {
-            // RFC 6525 5.1.1: double this request's own interval, independently
-            // of changes to the DATA RTO caused by T3 or fresh RTT measurements.
-            *self.reconfig_interval.get_or_insert(interval)
+        let interval = if let Some(current) = self.control_interval(timer) {
+            // Seed T2/RECONFIG from the current DATA RTO, then double their own
+            // interval on expiry. Rearming after serialization must neither
+            // compound T3 backoff nor apply this control timer's backoff twice.
+            // See RFC 9260 9.2 and RFC 6525 5.1.1.
+            *current.get_or_insert(interval)
         } else if matches!(timer, Timer::Ack | Timer::T3RTX) {
             interval
         } else {
@@ -128,8 +139,8 @@ impl TimerTable {
     pub fn stop(&mut self, timer: Timer) {
         self.data[timer as usize] = None;
         self.reset_retrans(timer);
-        if timer == Timer::Reconfig {
-            self.reconfig_interval = None;
+        if let Some(interval) = self.control_interval(timer) {
+            *interval = None;
         }
     }
 
@@ -140,10 +151,8 @@ impl TimerTable {
     pub fn is_expired(&mut self, timer: Timer, after: Instant) -> (bool, bool, usize) {
         let expired = self.data[timer as usize].is_some_and(|x| x <= after);
         let mut failure = false;
-        if expired && timer == Timer::Reconfig {
-            self.reconfig_interval = self
-                .reconfig_interval
-                .map(|interval| calculate_next_timeout(interval, 1));
+        if expired && let Some(interval) = self.control_interval(timer) {
+            *interval = interval.map(|previous| calculate_next_timeout(previous, 1));
         }
         if expired {
             self.retrans[timer as usize] += 1;
@@ -282,5 +291,36 @@ mod tests {
         timers.start(Timer::T1Init, now, RtoManager::new().get_rto());
 
         assert_eq!(timers.next_timeout(), Some(now + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn control_backoff_uses_one_interval_until_stopped() {
+        for timer in [Timer::T2Shutdown, Timer::Reconfig] {
+            let mut timers = TimerTable::new(TimerConfig {
+                max_reconfig_retrans: usize::MAX,
+                ..TimerConfig::default()
+            });
+            let mut now = Instant::now();
+            // A new procedure uses the current RTO, including previous DATA
+            // backoff. Later DATA RTT updates/backoffs cannot compound it.
+            timers.start(timer, now, 8000);
+            assert_eq!(Some(now + Duration::from_secs(8)), timers.get(timer));
+            for interval in [16, 32, 60, 60] {
+                now = timers.get(timer).unwrap();
+                assert_eq!((true, false), {
+                    let (expired, failed, _) = timers.is_expired(timer, now);
+                    (expired, failed)
+                });
+                timers.set(timer, None);
+                for data_rto in [60_000, 1000] {
+                    timers.start(timer, now, data_rto);
+                    assert_eq!(Some(now + Duration::from_secs(interval)), timers.get(timer));
+                }
+            }
+            timers.stop(timer);
+            timers.start(timer, now, 3000);
+            assert_eq!(Some(now + Duration::from_secs(3)), timers.get(timer));
+            assert_eq!((false, false, 0), timers.is_expired(timer, now));
+        }
     }
 }

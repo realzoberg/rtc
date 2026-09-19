@@ -1351,10 +1351,10 @@ fn test_message_abandonment_is_idempotent_after_partial_and_late_acks() -> Resul
         a.handle_sack(&sack, now + Duration::from_millis(50))?;
         while a.poll().is_some() {}
         let at = now + Duration::from_millis(100);
-        let messages = a.unretransmittable_messages(at, ChunkPayloadData::is_outstanding);
+        let messages = a.unretransmittable_messages(at, ChunkPayloadData::is_outstanding)?;
         assert_eq!(1, messages.len());
         let message = messages[0];
-        assert!(a.abandon_message(message));
+        assert!(a.abandon_message(message)?);
         let released: usize = std::iter::from_fn(|| a.poll())
             .filter_map(|event| {
                 if let Event::Stream(StreamEvent::BufferedAmountReleased { n_bytes, .. }) = event {
@@ -1365,7 +1365,7 @@ fn test_message_abandonment_is_idempotent_after_partial_and_late_acks() -> Resul
             })
             .sum();
         assert_eq!(4000 - a.max_payload_size as usize, released);
-        assert!(!a.abandon_message(message));
+        assert!(!a.abandon_message(message)?);
         assert!(
             a.poll().is_none(),
             "repeated abandonment must not release bytes twice"
@@ -1390,7 +1390,7 @@ fn test_message_abandonment_is_idempotent_after_partial_and_late_acks() -> Resul
         assert!(a.inflight_queue.get(first + 1).unwrap().acknowledged);
         assert!(!a.inflight_queue.get(first + 2).unwrap().acknowledged);
         assert!(a.poll().is_none());
-        assert!(!a.abandon_message(message));
+        assert!(!a.abandon_message(message)?);
         assert_eq!(4, a.stream(1)?.buffered_amount()?);
     }
     Ok(())
@@ -1406,9 +1406,9 @@ fn test_repeated_pending_abandonment_preserves_the_next_message() -> Result<()> 
     stream.set_reliability_params(true, ReliabilityType::Timed, 100)?;
     stream.write_sctp(now, &Bytes::from(vec![0; 4000]), ppi)?;
     stream.write_sctp(now, &Bytes::from_static(b"next"), ppi)?;
-    let message = a.pending_message_to_abandon();
-    assert!(a.abandon_message(message));
-    assert!(!a.abandon_message(message));
+    let message = a.pending_message_to_abandon()?;
+    assert!(a.abandon_message(message)?);
+    assert!(!a.abandon_message(message)?);
     a.on_messages_abandoned(now + Duration::from_millis(100));
     assert_eq!(first_tsn, a.my_next_tsn);
     assert!(a.inflight_queue.is_empty());
@@ -1605,6 +1605,9 @@ fn test_timed_zero_fragment_loss_restores_receive_window() -> Result<()> {
 
 #[path = "timer_deadline_test.rs"]
 mod timer_deadline_test;
+
+#[path = "retransmission_review_test.rs"]
+mod retransmission_review_test;
 
 #[test]
 fn test_reconfig_backoff_must_double_once() -> Result<()> {
