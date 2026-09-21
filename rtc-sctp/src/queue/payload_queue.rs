@@ -1,9 +1,63 @@
-use crate::chunk::chunk_payload_data::ChunkPayloadData;
+use crate::chunk::chunk_payload_data::{ChunkPayloadData, MessageId, MessageReliability};
 use crate::chunk::chunk_selective_ack::GapAckBlock;
 use crate::util::*;
 
 use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
+
+/// A fragmented message may have only one retained DATA chunk. Store that TSN
+/// inline until another fragment is queued.
+#[derive(Debug)]
+enum MessageTsns {
+    One(u32),
+    Fragmented(VecDeque<u32>),
+}
+
+impl MessageTsns {
+    fn insert(&mut self, tsn: u32) {
+        match self {
+            Self::One(first) => {
+                let pair = if sna32lt(tsn, *first) {
+                    [tsn, *first]
+                } else {
+                    [*first, tsn]
+                };
+                *self = Self::Fragmented(VecDeque::from(pair));
+            }
+            Self::Fragmented(tsns) => {
+                if tsns.back().is_none_or(|last| sna32lt(*last, tsn)) {
+                    tsns.push_back(tsn);
+                } else {
+                    let index = tsns.partition_point(|&item| sna32lt(item, tsn));
+                    tsns.insert(index, tsn);
+                }
+            }
+        }
+    }
+
+    /// Cumulative acknowledgment removes only a prefix of a message's TSNs.
+    /// Returns true when the whole index entry can be removed.
+    fn pop(&mut self, tsn: u32) -> bool {
+        match self {
+            Self::One(first) => {
+                debug_assert_eq!(*first, tsn);
+                true
+            }
+            Self::Fragmented(tsns) => {
+                debug_assert_eq!(tsns.front(), Some(&tsn));
+                tsns.pop_front();
+                tsns.is_empty()
+            }
+        }
+    }
+
+    fn to_vec(&self) -> Vec<u32> {
+        match self {
+            Self::One(tsn) => vec![*tsn],
+            Self::Fragmented(tsns) => tsns.iter().copied().collect(),
+        }
+    }
+}
 
 #[derive(Default, Debug)]
 pub(crate) struct PayloadQueue {
@@ -19,6 +73,9 @@ pub(crate) struct PayloadQueue {
     pub(crate) sorted: VecDeque<u32>,
     dup_tsn: Vec<u32>,
     n_bytes: usize,
+    /// Sent fragments of messages eligible for abandonment. A whole message
+    /// uses its candidate TSN directly; only fragmented messages need a group.
+    message_tsns: FxHashMap<MessageId, MessageTsns>,
     #[cfg(test)]
     pub(crate) track_lookups: bool,
     #[cfg(test)]
@@ -44,7 +101,23 @@ impl PayloadQueue {
         !(self.chunk_map.contains_key(&p.tsn) || sna32lte(p.tsn, cumulative_tsn))
     }
 
+    fn abandonment_id(p: &ChunkPayloadData) -> Option<MessageId> {
+        if p.beginning_fragment && p.ending_fragment {
+            return None;
+        }
+        match p.reliability {
+            MessageReliability::Reliable => None,
+            _ => p.message_id,
+        }
+    }
+
     pub(crate) fn push_no_check(&mut self, p: ChunkPayloadData) {
+        if let Some(id) = Self::abandonment_id(&p) {
+            self.message_tsns
+                .entry(id)
+                .and_modify(|tsns| tsns.insert(p.tsn))
+                .or_insert(MessageTsns::One(p.tsn));
+        }
         self.n_bytes += p.user_data.len();
         self.insert_sorted(p.tsn);
         self.chunk_map.insert(p.tsn, p);
@@ -62,10 +135,7 @@ impl PayloadQueue {
             return false;
         }
 
-        self.n_bytes += p.user_data.len();
-        self.insert_sorted(p.tsn);
-        self.chunk_map.insert(p.tsn, p);
-        //self.length += 1;
+        self.push_no_check(p);
 
         true
     }
@@ -75,13 +145,24 @@ impl PayloadQueue {
         if self.sorted.front() == Some(&tsn) {
             self.sorted.pop_front();
             if let Some(c) = self.chunk_map.remove(&tsn) {
-                //self.length -= 1;
+                if let Some(id) = Self::abandonment_id(&c) {
+                    let tsns = self.message_tsns.get_mut(&id).unwrap();
+                    if tsns.pop(tsn) {
+                        self.message_tsns.remove(&id);
+                    }
+                }
                 self.n_bytes -= c.user_data.len();
                 return Some(c);
             }
         }
 
         None
+    }
+
+    pub(crate) fn message_tsns(&self, id: MessageId) -> Vec<u32> {
+        self.message_tsns
+            .get(&id)
+            .map_or_else(Vec::new, MessageTsns::to_vec)
     }
 
     /// get returns reference to chunkPayloadData with the given TSN value.

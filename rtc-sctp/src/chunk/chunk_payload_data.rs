@@ -2,6 +2,7 @@ use super::{chunk_header::*, chunk_type::*, *};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::fmt;
+use std::num::NonZeroU64;
 use std::time::Instant;
 
 pub(crate) const PAYLOAD_DATA_ENDING_FRAGMENT_BITMASK: u8 = 1;
@@ -58,6 +59,18 @@ impl From<u32> for PayloadProtocolIdentifier {
             57 => PayloadProtocolIdentifier::BinaryEmpty,
             _ => PayloadProtocolIdentifier::Unknown,
         }
+    }
+}
+
+/// Association-local identity, unrelated to TSN, SSN, SID reuse or time.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub(crate) struct MessageId(NonZeroU64);
+
+impl MessageId {
+    /// Encode a zero-based association sequence with a niche for decoded DATA,
+    /// which has no local identity. Option<MessageId> stays one machine word.
+    pub(crate) fn new(sequence: u64) -> Self {
+        Self(NonZeroU64::new(sequence.checked_add(1).expect("message identity exhausted")).unwrap())
     }
 }
 
@@ -147,6 +160,8 @@ pub struct ChunkPayloadData {
     /// Set once, from the instant the caller passed to `Stream::write*`, and
     /// never reassigned. This is the baseline for `ReliabilityType::Timed`.
     pub(crate) created_at: Option<Instant>,
+    /// Sender identity shared by every fragment; absent on decoded peer DATA.
+    pub(crate) message_id: Option<MessageId>,
     /// Reliability belongs to the queued message, independently of its stream.
     pub(crate) reliability: MessageReliability,
     /// Identifies the stream incarnation whose send buffer owns this DATA.
@@ -178,6 +193,7 @@ impl Default for ChunkPayloadData {
             miss_indicator: 0,
             since: None,
             created_at: None,
+            message_id: None,
             reliability: MessageReliability::Reliable,
             stream_generation: 0,
             nsent: 0,
@@ -262,6 +278,7 @@ impl Chunk for ChunkPayloadData {
             miss_indicator: 0,
             since: None,
             created_at: None,
+            message_id: None,
             reliability: MessageReliability::Reliable,
             stream_generation: 0,
             nsent: 0,
