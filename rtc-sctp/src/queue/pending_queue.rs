@@ -181,7 +181,7 @@ mod tests {
 
     fn fragment(beginning: bool, ending: bool, unordered: bool) -> ChunkPayloadData {
         ChunkPayloadData {
-            message_id: Some(MessageId::new(0)),
+            message_id: MessageId::new(0),
             beginning_fragment: beginning,
             ending_fragment: ending,
             unordered,
@@ -231,7 +231,7 @@ mod tests {
             queue.push(fragment(false, true, unordered));
             assert!(queue.pop(true, unordered).is_some());
             let mut other = fragment(true, true, !unordered);
-            other.message_id = Some(MessageId::new(1));
+            other.message_id = MessageId::new(1);
             queue.push(other);
             let id = queue.peek().unwrap().message_id.unwrap();
             assert_eq!(1, queue.drain_message(id)?.len());

@@ -3,7 +3,7 @@ use crate::chunk::chunk_selective_ack::GapAckBlock;
 use crate::util::*;
 
 use rustc_hash::FxHashMap;
-use std::collections::VecDeque;
+use std::collections::{VecDeque, hash_map::Entry};
 
 /// A fragmented message may have only one retained DATA chunk. Store that TSN
 /// inline until another fragment is queued.
@@ -36,18 +36,16 @@ impl MessageTsns {
     }
 
     /// Cumulative acknowledgment removes only a prefix of a message's TSNs.
-    /// Returns true when the whole index entry can be removed.
-    fn pop(&mut self, tsn: u32) -> bool {
+    /// Returns None without mutation if the expected prefix is missing, or
+    /// Some(true) when the whole index entry can be removed.
+    fn pop(&mut self, tsn: u32) -> Option<bool> {
         match self {
-            Self::One(first) => {
-                debug_assert_eq!(*first, tsn);
-                true
-            }
-            Self::Fragmented(tsns) => {
-                debug_assert_eq!(tsns.front(), Some(&tsn));
+            Self::One(first) if *first == tsn => Some(true),
+            Self::Fragmented(tsns) if tsns.front() == Some(&tsn) => {
                 tsns.pop_front();
-                tsns.is_empty()
+                Some(tsns.is_empty())
             }
+            _ => None,
         }
     }
 
@@ -142,21 +140,23 @@ impl PayloadQueue {
 
     /// pop pops only if the oldest chunk's TSN matches the given TSN.
     pub(crate) fn pop(&mut self, tsn: u32) -> Option<ChunkPayloadData> {
-        if self.sorted.front() == Some(&tsn) {
-            self.sorted.pop_front();
-            if let Some(c) = self.chunk_map.remove(&tsn) {
-                if let Some(id) = Self::abandonment_id(&c) {
-                    let tsns = self.message_tsns.get_mut(&id).unwrap();
-                    if tsns.pop(tsn) {
-                        self.message_tsns.remove(&id);
-                    }
-                }
-                self.n_bytes -= c.user_data.len();
-                return Some(c);
+        if self.sorted.front() != Some(&tsn) {
+            return None;
+        }
+        let Entry::Occupied(entry) = self.chunk_map.entry(tsn) else {
+            return None;
+        };
+        // Validate the message index before removing DATA or updating accounting.
+        if let Some(id) = Self::abandonment_id(entry.get()) {
+            let tsns = self.message_tsns.get_mut(&id)?;
+            if tsns.pop(tsn)? {
+                self.message_tsns.remove(&id);
             }
         }
-
-        None
+        let c = entry.remove();
+        self.sorted.pop_front();
+        self.n_bytes -= c.user_data.len();
+        Some(c)
     }
 
     pub(crate) fn message_tsns(&self, id: MessageId) -> Vec<u32> {
@@ -268,5 +268,61 @@ impl PayloadQueue {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    #[test]
+    fn inconsistent_message_index_preserves_data_and_accounting() {
+        let id = MessageId::new(0).unwrap();
+        for invalid_index in [
+            None,
+            Some(MessageTsns::One(101)),
+            Some(MessageTsns::Fragmented(VecDeque::from([101, 100]))),
+        ] {
+            let mut queue = PayloadQueue::new();
+            for tsn in [100, 101] {
+                queue.push_no_check(ChunkPayloadData {
+                    tsn,
+                    message_id: Some(id),
+                    reliability: MessageReliability::Rexmit { max_retransmits: 1 },
+                    beginning_fragment: tsn == 100,
+                    ending_fragment: tsn == 101,
+                    user_data: Bytes::from_static(b"data"),
+                    ..Default::default()
+                });
+            }
+            if let Some(index) = invalid_index {
+                queue.message_tsns.insert(id, index);
+            } else {
+                queue.message_tsns.remove(&id);
+            }
+            let before = queue.message_tsns(id);
+            assert!(queue.pop(100).is_none());
+            assert_eq!(VecDeque::from([100, 101]), queue.sorted);
+            assert_eq!(2, queue.len());
+            assert_eq!(8, queue.get_num_bytes());
+            for tsn in [100, 101] {
+                assert_eq!(
+                    Bytes::from_static(b"data"),
+                    queue.get(tsn).unwrap().user_data
+                );
+            }
+            assert_eq!(before, queue.message_tsns(id));
+
+            // Repairing only the index must leave both DATA chunks removable.
+            queue
+                .message_tsns
+                .insert(id, MessageTsns::Fragmented(VecDeque::from([100, 101])));
+            assert!(queue.pop(100).is_some());
+            assert!(queue.pop(101).is_some());
+            assert!(queue.is_empty());
+            assert!(queue.message_tsns(id).is_empty());
+            assert_eq!(0, queue.get_num_bytes());
+        }
     }
 }

@@ -1,6 +1,51 @@
 use super::*;
 
 #[test]
+fn message_id_exhaustion_preserves_write_state_and_input() -> Result<()> {
+    let mut a = timed_test_association();
+    let now = Instant::now();
+    let ppi = PayloadProtocolIdentifier::Binary;
+    let queued = Bytes::from_static(b"already queued");
+    a.next_message_id = u64::MAX - 1;
+    a.open_stream(1, ppi)?.write_sctp(now, &queued, ppi)?;
+    assert_eq!(u64::MAX, a.next_message_id);
+    assert_eq!(
+        MessageId::new(u64::MAX - 1),
+        a.pending_queue.peek().unwrap().message_id
+    );
+    let sequence = a.streams.get(&1).unwrap().sequence_number;
+    a.stream(1)?
+        .set_buffered_amount_high_threshold(queued.len() + 1)?;
+    while a.poll().is_some() {}
+
+    let mut input = [Bytes::from_static(b"first"), Bytes::from_static(b"second")];
+    let original = input.clone();
+    for _ in 0..2 {
+        assert!(matches!(
+            a.stream(1)?.write_chunks(now, &mut input),
+            Err(Error::OtherSctpErr(message)) if message == "message identity exhausted"
+        ));
+        assert_eq!(original, input, "a failed write must not consume input");
+        assert_eq!(u64::MAX, a.next_message_id, "identities must not wrap");
+        assert_eq!(sequence, a.streams.get(&1).unwrap().sequence_number);
+        assert_eq!(queued.len(), a.stream(1)?.buffered_amount()?);
+        assert_eq!(1, a.pending_queue.len());
+        assert_eq!(queued.len(), a.pending_queue.get_num_bytes());
+        assert_eq!(queued, a.pending_queue.peek().unwrap().user_data);
+        assert!(a.inflight_queue.is_empty());
+        assert!(
+            a.poll().is_none(),
+            "a failed write must not emit buffer events"
+        );
+    }
+    // The last successfully allocated identity still carries a sendable message.
+    let sent = transmitted_data(&a.gather_outbound(now).0);
+    assert_eq!(1, sent.len());
+    assert_eq!(queued, sent[0].user_data);
+    Ok(())
+}
+
+#[test]
 fn a_stale_whole_message_selection_cannot_abandon_a_reused_tsn() -> Result<()> {
     for (policy, value) in [(ReliabilityType::Timed, 100), (ReliabilityType::Rexmit, 0)] {
         let first_tsn: u32 = 12345;

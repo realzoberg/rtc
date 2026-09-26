@@ -69,8 +69,9 @@ pub(crate) struct MessageId(NonZeroU64);
 impl MessageId {
     /// Encode a zero-based association sequence with a niche for decoded DATA,
     /// which has no local identity. Option<MessageId> stays one machine word.
-    pub(crate) fn new(sequence: u64) -> Self {
-        Self(NonZeroU64::new(sequence.checked_add(1).expect("message identity exhausted")).unwrap())
+    /// Returns None when the sequence is exhausted.
+    pub(crate) fn new(sequence: u64) -> Option<Self> {
+        NonZeroU64::new(sequence.checked_add(1)?).map(Self)
     }
 }
 

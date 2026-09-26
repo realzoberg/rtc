@@ -3213,26 +3213,31 @@ impl Association {
         Ok(())
     }
 
-    /// send_payload_data sends the data chunks.
-    ///
-    /// The queueing instant is already recorded on each chunk by `Stream::packetize`, so this
-    /// does not need one of its own.
-    pub(crate) fn send_payload_data(&mut self, chunks: Vec<ChunkPayloadData>) -> Result<()> {
+    /// Allocate an identity before consuming input or changing stream state.
+    pub(crate) fn allocate_message_id(&mut self) -> Result<MessageId> {
         let state = self.state();
         if state != AssociationState::Established {
             return Err(Error::ErrPayloadDataStateNotExist);
         }
 
-        let id = MessageId::new(self.next_message_id);
+        let id = MessageId::new(self.next_message_id)
+            .ok_or_else(|| Error::OtherSctpErr("message identity exhausted".into()))?;
         // MessageId::new has already checked that this increment cannot overflow.
         self.next_message_id += 1;
+        Ok(id)
+    }
+
+    /// send_payload_data sends the data chunks with their allocated identity.
+    ///
+    /// The queueing instant is already recorded on each chunk by `Stream::packetize`, so this
+    /// does not need one of its own.
+    pub(crate) fn send_payload_data(&mut self, id: MessageId, chunks: Vec<ChunkPayloadData>) {
         for mut c in chunks {
             c.message_id = Some(id);
             self.pending_queue.push(c);
         }
 
         self.awake_write_loop();
-        Ok(())
     }
 
     /// buffered_amount returns total amount (in bytes) of currently buffered user data.
