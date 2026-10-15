@@ -759,6 +759,7 @@ fn timed_test_association() -> Association {
     a.control_queue.clear();
     a.timers.stop(Timer::T1Init);
     a.set_state(AssociationState::Established);
+    a.peer_supports_reconfig = true;
     a.use_forward_tsn = true;
     a.rwnd = 65536;
     a.rto_mgr.set_rto(1000, true);
@@ -1791,3 +1792,6 @@ mod duplicate_report_test;
 
 #[path = "stream_scheduler_test.rs"]
 mod stream_scheduler_test;
+
+#[path = "transmit_reset_test.rs"]
+mod transmit_reset_test;

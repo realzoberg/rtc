@@ -5,7 +5,7 @@ use crate::config::StreamScheduler;
 use rustc_hash::FxHashMap;
 use shared::error::{Error, Result};
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Instant;
 
 /// The weight of a stream no one has weighted: the normal data channel priority (RFC 8832).
@@ -19,7 +19,6 @@ pub(crate) type PendingBaseQueue = VecDeque<ChunkPayloadData>;
 struct MessageSnapshot {
     id: Option<MessageId>,
     stream_identifier: u16,
-    stream_sequence_number: u16,
     stream_generation: u64,
     unordered: bool,
     payload_type: PayloadProtocolIdentifier,
@@ -32,7 +31,6 @@ impl MessageSnapshot {
         Self {
             id: c.message_id,
             stream_identifier: c.stream_identifier,
-            stream_sequence_number: c.stream_sequence_number,
             stream_generation: c.stream_generation,
             unordered: c.unordered,
             payload_type: c.payload_type,
@@ -44,7 +42,6 @@ impl MessageSnapshot {
     fn matches(&self, c: &ChunkPayloadData) -> bool {
         self.id == c.message_id
             && self.stream_identifier == c.stream_identifier
-            && self.stream_sequence_number == c.stream_sequence_number
             && self.stream_generation == c.stream_generation
             && self.unordered == c.unordered
     }
@@ -196,28 +193,6 @@ fn pop_front_fragment<T>(
     }
 }
 
-fn entry_message(entry: &mut PendingEntry) -> Option<&mut QueuedMessage> {
-    match entry {
-        PendingEntry::Message(message) => Some(message),
-        PendingEntry::Reset(_) => None,
-    }
-}
-
-fn entry_whole(entry: PendingEntry) -> Option<ChunkPayloadData> {
-    match entry {
-        PendingEntry::Message(QueuedMessage::Whole(c)) => Some(c),
-        _ => None,
-    }
-}
-
-fn tagged_message(entry: &mut (u128, PendingEntry)) -> Option<&mut QueuedMessage> {
-    entry_message(&mut entry.1)
-}
-
-fn tagged_whole(entry: (u128, PendingEntry)) -> Option<ChunkPayloadData> {
-    entry_whole(entry.1)
-}
-
 /// A reset is control state, with no DATA payload or reliability policy.
 #[derive(Debug)]
 pub(crate) struct ResetMarker {
@@ -226,14 +201,25 @@ pub(crate) struct ResetMarker {
 
 #[derive(Debug)]
 enum PendingEntry {
-    Message(QueuedMessage),
-    Reset(ResetMarker),
+    // Preserve the weight at write time while a reset holds the message.
+    Message(QueuedMessage, u16),
+    Reset(u64, ResetMarker),
+}
+
+#[derive(Debug, Default)]
+struct PendingStreamData {
+    ready_chunks: usize,
+    resetting: bool,
+    reset_in_flight: bool,
+    blocked_reset: Option<(u64, ResetMarker)>,
+    /// Later messages and resets retain their order outside the ready queues.
+    waiting: VecDeque<PendingEntry>,
 }
 
 /// One stream's queue under weighted fair queueing, each entry with its finish tag.
 #[derive(Debug)]
 struct WfqStream {
-    entries: VecDeque<(u128, PendingEntry)>,
+    entries: VecDeque<(u128, QueuedMessage)>,
     weight: u16,
     last_finish: u128,
 }
@@ -253,7 +239,7 @@ impl Default for WfqStream {
 #[derive(Debug, Default)]
 struct Wfq {
     streams: FxHashMap<u16, WfqStream>,
-    /// Each non-empty stream keyed by its head: a reset head sorts first, then message head tags.
+    /// Each stream with ready DATA, keyed by its head message finish tag.
     heads: BTreeSet<(u128, u16)>,
     /// The finish tag of the message most recently started.
     virtual_time: u128,
@@ -261,10 +247,8 @@ struct Wfq {
 
 impl Wfq {
     fn head_key(&self, stream: u16) -> Option<(u128, u16)> {
-        match self.streams.get(&stream)?.entries.front()? {
-            (_, PendingEntry::Reset(_)) => Some((0, stream)),
-            (tag, PendingEntry::Message(_)) => Some((tag.saturating_add(1), stream)),
-        }
+        let (tag, _) = self.streams.get(&stream)?.entries.front()?;
+        Some((tag.saturating_add(1), stream))
     }
 
     /// Runs `change` on one stream's queue and re-keys the stream by its new head.
@@ -280,29 +264,32 @@ impl Wfq {
         result
     }
 
-    fn push(&mut self, stream: u16, bytes: usize, entry: PendingEntry) {
+    fn push(&mut self, stream: u16, bytes: usize, weight: u16, entry: QueuedMessage) {
         self.update(stream, |s, virtual_time| {
             let start = s.last_finish.max(virtual_time);
-            let tag = start + ((bytes as u128) << 16) / u128::from(s.weight);
+            let tag = start + ((bytes as u128) << 16) / u128::from(weight);
             s.last_finish = tag;
             s.entries.push_back((tag, entry));
         });
     }
 
-    /// The stream whose head goes next, and whether that head is a reset.
-    fn next(&self) -> Option<(u16, bool)> {
-        self.heads.first().map(|&(key, stream)| (stream, key == 0))
+    /// The stream whose ready message goes next.
+    fn next(&self) -> Option<u16> {
+        self.heads.first().map(|&(_, stream)| stream)
     }
 
-    fn queue_mut(&mut self, stream: u16) -> Option<&mut VecDeque<(u128, PendingEntry)>> {
+    fn queue_mut(&mut self, stream: u16) -> Option<&mut VecDeque<(u128, QueuedMessage)>> {
         self.streams.get_mut(&stream).map(|s| &mut s.entries)
     }
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct PendingQueue {
-    unordered_queue: VecDeque<PendingEntry>,
-    ordered_queue: VecDeque<PendingEntry>,
+    unordered_queue: VecDeque<QueuedMessage>,
+    ordered_queue: VecDeque<QueuedMessage>,
+    ready_resets: BTreeMap<u64, ResetMarker>,
+    next_reset_order: u64,
+    stream_data: FxHashMap<u16, PendingStreamData>,
     queue_len: usize,
     n_bytes: usize,
     selected: bool,
@@ -340,54 +327,135 @@ impl PendingQueue {
         };
         self.n_bytes += message.bytes();
         self.queue_len += message.len();
-        let snapshot = message.snapshot();
+        let stream = message.snapshot().stream_identifier;
+        let weight = self
+            .wfq
+            .as_ref()
+            .and_then(|wfq| wfq.streams.get(&stream))
+            .map_or(DEFAULT_STREAM_WEIGHT, |s| s.weight);
+        let data = self.stream_data.entry(stream).or_default();
+        if data.resetting {
+            data.waiting
+                .push_back(PendingEntry::Message(message, weight));
+        } else {
+            data.ready_chunks += message.len();
+            self.push_ready_message(message, weight);
+        }
+    }
+
+    fn push_ready_message(&mut self, message: QueuedMessage, weight: u16) {
         if let Some(wfq) = self.wfq.as_mut() {
             wfq.push(
-                snapshot.stream_identifier,
+                message.snapshot().stream_identifier,
                 message.bytes(),
-                PendingEntry::Message(message),
+                weight,
+                message,
             );
             return;
         }
-        let queue = if snapshot.unordered {
+        let queue = if message.snapshot().unordered {
             &mut self.unordered_queue
         } else {
             &mut self.ordered_queue
         };
-        queue.push_back(PendingEntry::Message(message));
+        queue.push_back(message);
     }
 
-    pub(crate) fn push_reset(&mut self, reset: ResetMarker) {
+    pub(crate) fn push_reset(&mut self, reset: ResetMarker) -> Result<()> {
+        self.check_reset_capacity(1)?;
+        let order = self.next_reset_order;
+        let data = self.stream_data.entry(reset.stream_identifier).or_default();
+        self.next_reset_order += 1;
         self.queue_len += 1;
-        if let Some(wfq) = self.wfq.as_mut() {
-            wfq.push(reset.stream_identifier, 0, PendingEntry::Reset(reset));
-            return;
+        if data.resetting {
+            data.waiting.push_back(PendingEntry::Reset(order, reset));
+        } else {
+            Self::activate_reset(data, &mut self.ready_resets, order, reset);
         }
-        self.ordered_queue.push_back(PendingEntry::Reset(reset));
+        Ok(())
     }
 
-    /// Under weighted fair queueing, the stream whose message goes next; `None` while a reset
-    /// waits at a stream's head and no message is part sent.
-    fn next_wfq_stream(&self) -> Option<u16> {
-        let wfq = self.wfq.as_ref()?;
-        if self.selected {
-            return Some(self.selected_stream);
-        }
-        match wfq.next()? {
-            (stream, false) => Some(stream),
-            (_, true) => None,
+    pub(crate) fn check_reset_capacity(&self, count: u64) -> Result<()> {
+        self.next_reset_order
+            .checked_add(count)
+            .ok_or_else(|| Error::OtherSctpErr("reset queue order exhausted".into()))?;
+        Ok(())
+    }
+
+    fn activate_reset(
+        data: &mut PendingStreamData,
+        ready_resets: &mut BTreeMap<u64, ResetMarker>,
+        order: u64,
+        reset: ResetMarker,
+    ) {
+        data.resetting = true;
+        if data.ready_chunks == 0 {
+            ready_resets.insert(order, reset);
+        } else {
+            data.blocked_reset = Some((order, reset));
         }
     }
 
-    fn next_wfq_message(&self) -> Option<&QueuedMessage> {
-        let stream = self.next_wfq_stream()?;
-        match self.wfq.as_ref()?.streams.get(&stream)?.entries.front()? {
-            (_, PendingEntry::Message(message)) => Some(message),
-            (_, PendingEntry::Reset(_)) => None,
-        }
+    pub(crate) fn is_resetting(&self, si: u16) -> bool {
+        self.stream_data.get(&si).is_some_and(|data| data.resetting)
     }
 
-    fn front_queue(&self) -> &VecDeque<PendingEntry> {
+    pub(crate) fn validate_reset_completion(&self, si: u16) -> Result<()> {
+        if !self
+            .stream_data
+            .get(&si)
+            .is_some_and(|data| data.resetting && data.reset_in_flight && data.ready_chunks == 0)
+        {
+            return Err(Error::OtherSctpErr(
+                "reset boundary is not in flight".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Release messages up to the next boundary. Their SSNs will be assigned
+    /// by the TX direction only when they can actually be transmitted.
+    pub(crate) fn complete_reset(&mut self, si: u16) -> Result<()> {
+        self.validate_reset_completion(si)?;
+        let Some(mut data) = self.stream_data.remove(&si) else {
+            return Err(Error::OtherSctpErr("missing reset stream".into()));
+        };
+        data.resetting = false;
+        data.reset_in_flight = false;
+        while let Some(entry) = data.waiting.pop_front() {
+            match entry {
+                PendingEntry::Message(message, weight) => {
+                    data.ready_chunks += message.len();
+                    self.push_ready_message(message, weight);
+                }
+                PendingEntry::Reset(order, reset) => {
+                    Self::activate_reset(&mut data, &mut self.ready_resets, order, reset);
+                    break;
+                }
+            }
+        }
+        if data.resetting || data.ready_chunks > 0 {
+            self.stream_data.insert(si, data);
+        }
+        Ok(())
+    }
+
+    /// The caller validates the remaining count before removing any DATA.
+    fn release_ready_chunks(
+        data: &mut PendingStreamData,
+        ready_resets: &mut BTreeMap<u64, ResetMarker>,
+        remaining: usize,
+    ) -> bool {
+        data.ready_chunks = remaining;
+        if remaining == 0
+            && let Some((order, reset)) = data.blocked_reset.take()
+        {
+            ready_resets.insert(order, reset);
+        }
+        remaining == 0 && !data.resetting
+    }
+
+    fn front_queue(&self) -> &VecDeque<QueuedMessage> {
         if self.selected {
             if self.unordered_is_selected {
                 &self.unordered_queue
@@ -401,47 +469,45 @@ impl PendingQueue {
         }
     }
 
-    pub(crate) fn peek(&self) -> Option<&ChunkPayloadData> {
-        if self.wfq.is_some() {
-            return self.next_wfq_message()?.peek();
-        }
-        match self.front_queue().front()? {
-            PendingEntry::Message(message) => message.peek(),
-            PendingEntry::Reset(_) => None,
+    fn next_wfq_stream(&self) -> Option<u16> {
+        let wfq = self.wfq.as_ref()?;
+        if self.selected {
+            Some(self.selected_stream)
+        } else {
+            wfq.next()
         }
     }
 
-    /// Preserve the existing ordered/unordered scheduling and reset position. Under weighted fair
-    /// queueing a reset leaves once its stream's earlier messages have, ahead of other streams.
+    fn next_wfq_message(&self) -> Option<&QueuedMessage> {
+        let stream = self.next_wfq_stream()?;
+        self.wfq
+            .as_ref()?
+            .streams
+            .get(&stream)?
+            .entries
+            .front()
+            .map(|(_, message)| message)
+    }
+
+    pub(crate) fn peek(&self) -> Option<&ChunkPayloadData> {
+        if self.wfq.is_some() {
+            self.next_wfq_message()?.peek()
+        } else {
+            self.front_queue().front()?.peek()
+        }
+    }
+
+    /// A reset waits only for its own stream's preceding DATA. Readiness is
+    /// updated on retirement, without rescanning blocked resets per fragment.
     pub(crate) fn pop_ready_reset(&mut self) -> Option<ResetMarker> {
-        if let Some(wfq) = self.wfq.as_mut() {
-            if self.selected {
-                return None;
-            }
-            let (stream, true) = wfq.next()? else {
-                return None;
-            };
-            let queue_len = self.queue_len.checked_sub(1)?;
-            let reset = wfq.update(stream, |s, _| match s.entries.front()? {
-                (_, PendingEntry::Reset(_)) => match s.entries.pop_front()? {
-                    (_, PendingEntry::Reset(reset)) => Some(reset),
-                    _ => None,
-                },
-                _ => None,
-            })?;
-            self.queue_len = queue_len;
-            return Some(reset);
-        }
-        if self.selected || !self.unordered_queue.is_empty() {
+        let (_, reset) = self.ready_resets.first_key_value()?;
+        let data = self.stream_data.get_mut(&reset.stream_identifier)?;
+        if !data.resetting || data.reset_in_flight || data.ready_chunks != 0 {
             return None;
         }
-        let PendingEntry::Reset(_) = self.ordered_queue.front()? else {
-            return None;
-        };
         let queue_len = self.queue_len.checked_sub(1)?;
-        let PendingEntry::Reset(reset) = self.ordered_queue.pop_front()? else {
-            return None;
-        };
+        let (_, reset) = self.ready_resets.pop_first()?;
+        data.reset_in_flight = true;
         self.queue_len = queue_len;
         Some(reset)
     }
@@ -452,10 +518,7 @@ impl PendingQueue {
         let next = if self.wfq.is_some() {
             self.next_wfq_message()
         } else {
-            match self.front_queue().front() {
-                Some(PendingEntry::Message(message)) => Some(message),
-                _ => None,
-            }
+            self.front_queue().front()
         };
         let Some(message) = next else {
             return Ok(vec![]);
@@ -470,19 +533,30 @@ impl PendingQueue {
                 "invalid pending message accounting".into(),
             ));
         }
-        let entry = match self.wfq.as_mut() {
+        let data = self
+            .stream_data
+            .get_mut(&snapshot.stream_identifier)
+            .ok_or_else(|| Error::OtherSctpErr("missing pending stream".into()))?;
+        let remaining = data
+            .ready_chunks
+            .checked_sub(count)
+            .ok_or_else(|| Error::OtherSctpErr("invalid pending stream accounting".into()))?;
+        let message = match self.wfq.as_mut() {
             Some(wfq) => wfq
                 .update(snapshot.stream_identifier, |s, _| s.entries.pop_front())
-                .map(|(_, entry)| entry),
+                .map(|(_, message)| message),
             None if snapshot.unordered => self.unordered_queue.pop_front(),
             None => self.ordered_queue.pop_front(),
         };
-        let Some(PendingEntry::Message(message)) = entry else {
+        let Some(message) = message else {
             return Err(Error::OtherSctpErr("missing pending message".into()));
         };
         self.queue_len -= count;
         self.n_bytes -= bytes;
         self.selected = false;
+        if Self::release_ready_chunks(data, &mut self.ready_resets, remaining) {
+            self.stream_data.remove(&snapshot.stream_identifier);
+        }
         Ok(message.into_fragments())
     }
 
@@ -506,16 +580,28 @@ impl PendingQueue {
         } else {
             &mut self.ordered_queue
         };
-        let PendingEntry::Message(message) = queue.front()? else {
-            return None;
-        };
-        let n_bytes = self.n_bytes.checked_sub(message.peek()?.user_data.len())?;
+        let message = queue.front()?;
+        let first = message.peek()?;
+        let si = first.stream_identifier;
+        let data = self.stream_data.get_mut(&si)?;
+        let remaining = data.ready_chunks.checked_sub(1)?;
+        let n_bytes = self.n_bytes.checked_sub(first.user_data.len())?;
         let queue_len = self.queue_len.checked_sub(1)?;
-        let c = pop_front_fragment(queue, entry_message, entry_whole)?;
+        let c = pop_front_fragment(
+            queue,
+            |message| Some(message),
+            |message| match message {
+                QueuedMessage::Whole(c) => Some(c),
+                _ => None,
+            },
+        )?;
         self.selected = !c.ending_fragment;
         self.unordered_is_selected = unordered;
         self.n_bytes = n_bytes;
         self.queue_len = queue_len;
+        if Self::release_ready_chunks(data, &mut self.ready_resets, remaining) {
+            self.stream_data.remove(&si);
+        }
         Some(c)
     }
 
@@ -530,11 +616,21 @@ impl PendingQueue {
             .n_bytes
             .checked_sub(self.next_wfq_message()?.peek()?.user_data.len())?;
         let queue_len = self.queue_len.checked_sub(1)?;
+        let data = self.stream_data.get_mut(&stream)?;
+        let remaining = data.ready_chunks.checked_sub(1)?;
         let starting = !self.selected;
         let wfq = self.wfq.as_mut()?;
         let (c, tag) = wfq.update(stream, |s, _| {
             let tag = s.entries.front()?.0;
-            pop_front_fragment(&mut s.entries, tagged_message, tagged_whole).map(|c| (c, tag))
+            pop_front_fragment(
+                &mut s.entries,
+                |(_, message)| Some(message),
+                |(_, message)| match message {
+                    QueuedMessage::Whole(c) => Some(c),
+                    _ => None,
+                },
+            )
+            .map(|c| (c, tag))
         })?;
         if starting {
             wfq.virtual_time = wfq.virtual_time.max(tag);
@@ -543,6 +639,9 @@ impl PendingQueue {
         self.selected_stream = stream;
         self.n_bytes = n_bytes;
         self.queue_len = queue_len;
+        if Self::release_ready_chunks(data, &mut self.ready_resets, remaining) {
+            self.stream_data.remove(&stream);
+        }
         Some(c)
     }
 
@@ -578,24 +677,29 @@ mod tests {
 
     #[test]
     fn invalid_message_drain_preserves_fragments_and_accounting() {
-        for unordered in [false, true] {
-            for next_message in [false, true] {
-                let mut queue = PendingQueue::new();
-                queue.push_message(vec![
-                    fragment(true, false, unordered),
-                    fragment(false, false, unordered),
-                ]);
-                if next_message {
-                    // Even a malformed tail must not consume the next owner.
-                    queue.push_message(vec![fragment(true, true, unordered)]);
+        for scheduler in [
+            StreamScheduler::FirstComeFirstServed,
+            StreamScheduler::WeightedFairQueueing,
+        ] {
+            for unordered in [false, true] {
+                for next_message in [false, true] {
+                    let mut queue = PendingQueue::with_scheduler(scheduler);
+                    queue.push_message(vec![
+                        fragment(true, false, unordered),
+                        fragment(false, false, unordered),
+                    ]);
+                    if next_message {
+                        // Even a malformed tail must not consume the next owner.
+                        queue.push_message(vec![fragment(true, true, unordered)]);
+                    }
+                    let id = queue.peek().unwrap().message_id.unwrap();
+                    let (len, bytes) = (queue.len(), queue.get_num_bytes());
+                    assert!(queue.drain_message(id).is_err());
+                    assert_eq!(Some(id), queue.peek().unwrap().message_id);
+                    assert_eq!(len, queue.len());
+                    assert_eq!(bytes, queue.get_num_bytes());
+                    assert!(!queue.selected);
                 }
-                let id = queue.peek().unwrap().message_id.unwrap();
-                let (len, bytes) = (queue.len(), queue.get_num_bytes());
-                assert!(queue.drain_message(id).is_err());
-                assert_eq!(Some(id), queue.peek().unwrap().message_id);
-                assert_eq!(len, queue.len());
-                assert_eq!(bytes, queue.get_num_bytes());
-                assert!(!queue.selected);
             }
         }
     }
@@ -613,29 +717,34 @@ mod tests {
 
     #[test]
     fn invalid_batch_pop_preserves_fragments_and_accounting() {
-        for unordered in [false, true] {
-            for early_end in [false, true] {
-                let mut queue = PendingQueue::new();
-                queue.push_message(vec![
-                    fragment(true, early_end, unordered),
-                    fragment(!early_end, true, unordered),
-                ]);
-                let mut later = fragment(true, true, unordered);
-                later.message_id = MessageId::new(1);
-                queue.push_message(vec![later]);
-                if !early_end {
-                    // The first fragment is valid, but the tail repeats B.
-                    assert!(queue.pop(true, unordered).is_some());
+        for scheduler in [
+            StreamScheduler::FirstComeFirstServed,
+            StreamScheduler::WeightedFairQueueing,
+        ] {
+            for unordered in [false, true] {
+                for early_end in [false, true] {
+                    let mut queue = PendingQueue::with_scheduler(scheduler);
+                    queue.push_message(vec![
+                        fragment(true, early_end, unordered),
+                        fragment(!early_end, true, unordered),
+                    ]);
+                    let mut later = fragment(true, true, unordered);
+                    later.message_id = MessageId::new(1);
+                    queue.push_message(vec![later]);
+                    if !early_end {
+                        // The first fragment is valid, but the tail repeats B.
+                        assert!(queue.pop(true, unordered).is_some());
+                    }
+                    let (len, bytes) = (queue.len(), queue.get_num_bytes());
+                    let first = queue.peek().unwrap();
+                    let id = first.message_id.unwrap();
+                    assert!(queue.pop(first.beginning_fragment, unordered).is_none());
+                    assert!(queue.drain_message(id).is_err());
+                    assert_eq!(Some(id), queue.peek().unwrap().message_id);
+                    assert_eq!(len, queue.len());
+                    assert_eq!(bytes, queue.get_num_bytes());
+                    assert_eq!(!early_end, queue.selected);
                 }
-                let (len, bytes) = (queue.len(), queue.get_num_bytes());
-                let first = queue.peek().unwrap();
-                let id = first.message_id.unwrap();
-                assert!(queue.pop(first.beginning_fragment, unordered).is_none());
-                assert!(queue.drain_message(id).is_err());
-                assert_eq!(Some(id), queue.peek().unwrap().message_id);
-                assert_eq!(len, queue.len());
-                assert_eq!(bytes, queue.get_num_bytes());
-                assert_eq!(!early_end, queue.selected);
             }
         }
     }
@@ -687,9 +796,7 @@ mod tests {
         let buffer = chunks.as_ptr();
         let capacity = chunks.capacity();
         queue.push_message(chunks);
-        let Some(PendingEntry::Message(QueuedMessage::Fragmented { fragments, .. })) =
-            queue.ordered_queue.front()
-        else {
+        let Some(QueuedMessage::Fragmented { fragments, .. }) = queue.ordered_queue.front() else {
             panic!("expected a fragmented message");
         };
         assert_eq!(buffer, fragments.as_slices().0.as_ptr());
@@ -702,10 +809,10 @@ mod tests {
         assert_eq!(MessageId::new(0), queue.peek().unwrap().message_id);
         assert!(matches!(
             queue.ordered_queue.front(),
-            Some(PendingEntry::Message(QueuedMessage::Fragmented {
+            Some(QueuedMessage::Fragmented {
                 next_fragment: 1,
                 ..
-            }))
+            })
         ));
         let tail = queue.pop(false, false).unwrap();
         assert_eq!(Some(created), tail.created_at);
@@ -737,47 +844,120 @@ mod tests {
 
     #[test]
     fn sending_or_abandoning_a_tail_preserves_the_reset_boundary() -> Result<()> {
-        for unordered in [false, true] {
-            for abandon in [false, true] {
-                let mut queue = PendingQueue::new();
-                queue.push_message(vec![
-                    fragment(true, false, unordered),
-                    fragment(false, true, unordered),
-                ]);
-                queue.push_reset(ResetMarker {
-                    stream_identifier: 0,
-                });
-                let mut later = fragment(true, true, false);
-                later.message_id = MessageId::new(1);
-                later.stream_generation += 1;
-                queue.push_message(vec![later]);
+        for scheduler in [
+            StreamScheduler::FirstComeFirstServed,
+            StreamScheduler::WeightedFairQueueing,
+        ] {
+            for unordered in [false, true] {
+                for abandon in [false, true] {
+                    let mut queue = PendingQueue::with_scheduler(scheduler);
+                    queue.push_message(vec![
+                        fragment(true, false, unordered),
+                        fragment(false, true, unordered),
+                    ]);
+                    queue
+                        .push_reset(ResetMarker {
+                            stream_identifier: 0,
+                        })
+                        .unwrap();
+                    let mut later = fragment(true, true, false);
+                    later.message_id = MessageId::new(1);
+                    later.stream_generation += 1;
+                    queue.push_message(vec![later]);
 
-                let id = queue.pop(true, unordered).unwrap().message_id.unwrap();
-                assert!(queue.pop_ready_reset().is_none());
-                assert_eq!(3, queue.len());
-                assert_eq!(8, queue.get_num_bytes());
-                if abandon {
-                    assert_eq!(1, queue.drain_message(id)?.len());
+                    let id = queue.pop(true, unordered).unwrap().message_id.unwrap();
+                    assert!(queue.pop_ready_reset().is_none());
+                    assert_eq!(3, queue.len());
+                    assert_eq!(8, queue.get_num_bytes());
+                    if abandon {
+                        assert_eq!(1, queue.drain_message(id)?.len());
+                        assert!(queue.drain_message(id)?.is_empty());
+                    } else {
+                        assert!(queue.pop(false, unordered).unwrap().ending_fragment);
+                    }
+                    // Neither DATA operation can consume a control marker.
+                    assert!(queue.peek().is_none());
+                    assert!(queue.pop(true, false).is_none());
+                    assert_eq!(0, queue.pop_ready_reset().unwrap().stream_identifier);
+                    assert!(queue.peek().is_none());
+                    queue.complete_reset(0).unwrap();
+                    assert!(queue.pop_ready_reset().is_none());
+                    assert_eq!(1, queue.len());
+                    assert_eq!(4, queue.get_num_bytes());
                     assert!(queue.drain_message(id)?.is_empty());
-                } else {
-                    assert!(queue.pop(false, unordered).unwrap().ending_fragment);
+                    let later = queue.pop(true, false).unwrap();
+                    assert_eq!(MessageId::new(1), later.message_id);
+                    assert_eq!(1, later.stream_generation);
+                    assert!(queue.is_empty());
+                    assert_eq!(0, queue.get_num_bytes());
                 }
-                // Neither DATA operation can consume a control marker.
-                assert!(queue.peek().is_none());
-                assert!(queue.pop(true, false).is_none());
-                assert_eq!(0, queue.pop_ready_reset().unwrap().stream_identifier);
-                assert!(queue.pop_ready_reset().is_none());
-                assert_eq!(1, queue.len());
-                assert_eq!(4, queue.get_num_bytes());
-                assert!(queue.drain_message(id)?.is_empty());
-                let later = queue.pop(true, false).unwrap();
-                assert_eq!(MessageId::new(1), later.message_id);
-                assert_eq!(1, later.stream_generation);
-                assert!(queue.is_empty());
-                assert_eq!(0, queue.get_num_bytes());
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn reset_releases_only_messages_before_the_next_boundary() -> Result<()> {
+        for scheduler in [
+            StreamScheduler::FirstComeFirstServed,
+            StreamScheduler::WeightedFairQueueing,
+        ] {
+            let mut queue = PendingQueue::with_scheduler(scheduler);
+            queue.push_reset(ResetMarker {
+                stream_identifier: 0,
+            })?;
+            queue.push_message(vec![
+                fragment(true, false, false),
+                fragment(false, true, false),
+            ]);
+            queue.push_reset(ResetMarker {
+                stream_identifier: 0,
+            })?;
+            let mut later = fragment(true, true, true);
+            later.message_id = MessageId::new(1);
+            queue.push_message(vec![later]);
+            assert_eq!(0, queue.pop_ready_reset().unwrap().stream_identifier);
+            assert!(queue.pop_ready_reset().is_none());
+            assert!(queue.peek().is_none());
+            assert_eq!(12, queue.get_num_bytes());
+            queue.complete_reset(0)?;
+            assert!(queue.pop(true, false).unwrap().beginning_fragment);
+            assert!(queue.pop_ready_reset().is_none());
+            assert!(queue.pop(false, false).unwrap().ending_fragment);
+            assert_eq!(0, queue.pop_ready_reset().unwrap().stream_identifier);
+            assert!(queue.peek().is_none());
+            assert_eq!(4, queue.get_num_bytes());
+            queue.complete_reset(0)?;
+            assert_eq!(MessageId::new(1), queue.pop(true, true).unwrap().message_id);
+            assert!(queue.is_empty());
+            assert_eq!(0, queue.get_num_bytes());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn exhausted_reset_order_leaves_message_and_gate_unchanged() {
+        for scheduler in [
+            StreamScheduler::FirstComeFirstServed,
+            StreamScheduler::WeightedFairQueueing,
+        ] {
+            let mut queue = PendingQueue::with_scheduler(scheduler);
+            queue.push_message(vec![fragment(true, true, false)]);
+            queue.next_reset_order = u64::MAX;
+            assert!(
+                queue
+                    .push_reset(ResetMarker {
+                        stream_identifier: 0
+                    })
+                    .is_err()
+            );
+            assert!(!queue.is_resetting(0));
+            assert_eq!(1, queue.len());
+            assert_eq!(4, queue.get_num_bytes());
+            assert!(queue.pop_ready_reset().is_none());
+            assert!(queue.pop(true, false).is_some());
+            assert!(queue.is_empty());
+        }
     }
 
     fn wfq() -> PendingQueue {
@@ -883,21 +1063,54 @@ mod tests {
     }
 
     #[test]
-    fn a_reset_waits_only_for_its_own_streams_messages() {
+    fn a_reset_waits_only_for_its_own_streams_messages() -> Result<()> {
         let mut queue = wfq();
         queue.push_message(message(1, 0, &[100]));
         queue.push_reset(ResetMarker {
             stream_identifier: 1,
-        });
+        })?;
         for i in 1..10 {
             queue.push_message(message(2, i, &[100]));
         }
 
         assert_eq!(1, pop_next(&mut queue).unwrap().stream_identifier);
-        assert!(queue.peek().is_none(), "the reset goes ahead of stream 2");
+        // The association checks ready resets before DATA; other streams remain
+        // eligible while an earlier reset result is still outstanding.
         assert_eq!(1, queue.pop_ready_reset().unwrap().stream_identifier);
         assert_eq!(2, pop_next(&mut queue).unwrap().stream_identifier);
         assert_eq!(8, queue.len());
+        Ok(())
+    }
+
+    #[test]
+    fn a_priority_change_does_not_reweight_messages_waiting_for_reset() -> Result<()> {
+        let mut queue = wfq();
+        queue.set_weight(1, 128);
+        queue.push_reset(ResetMarker {
+            stream_identifier: 1,
+        })?;
+        queue.push_message(message(1, 1, &[1024]));
+        queue.set_weight(1, 1024);
+        queue.push_message(message(1, 2, &[1024]));
+        for id in 3..=5 {
+            queue.push_message(message(2, id, &[1024]));
+        }
+        assert_eq!(1, queue.pop_ready_reset().unwrap().stream_identifier);
+        queue.complete_reset(1)?;
+
+        let order: Vec<_> = std::iter::from_fn(|| pop_next(&mut queue))
+            .map(|c| c.message_id)
+            .collect();
+        assert_eq!(
+            [3, 1, 4, 2, 5]
+                .into_iter()
+                .map(MessageId::new)
+                .collect::<Vec<_>>(),
+            order
+        );
+        assert!(queue.is_empty());
+        assert_eq!(0, queue.get_num_bytes());
+        Ok(())
     }
 
     #[test]
