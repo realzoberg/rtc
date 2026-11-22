@@ -140,35 +140,27 @@ impl Association {
         now: Instant,
         response: &ParamReconfigResponse,
     ) -> Result<()> {
-        let Some(reset) = &self.outgoing_reset else {
+        let Some(reset) = &mut self.outgoing_reset else {
             return Ok(());
         };
         // H1: a stale result cannot change the current request or its timer.
+        // E1 stops the timer but establishes no result, so the outstanding
+        // request still accepts its own; the query at retry_at covers loss.
         if reset.request.reconfig_request_sequence_number
             != response.reconfig_response_sequence_number
-            || !matches!(reset.phase, RequestPhase::Active)
-            || self.timers.get(Timer::Reconfig).is_none()
         {
             return Ok(());
         }
         if response.result == ReconfigResult::InProgress {
+            reset.phase = RequestPhase::Active;
             self.will_retransmit_reconfig = false;
             self.timers.stop(Timer::Reconfig);
             self.timers
                 .restart_reconfig_in_progress(now, self.rto_mgr.get_rto());
             return Ok(());
         }
-        if matches!(
-            response.result,
-            ReconfigResult::ErrorBadSequenceNumber | ReconfigResult::Unknown
-        ) {
-            // The result establishes neither the old nor the new SSN space.
-            // Keep serialization until a known outcome; never guess on reuse.
-            let abort = self.create_packet(vec![Box::new(ChunkAbort::default())]);
-            self.close(AssociationError::TransportError)?;
-            self.control_queue.push_back(abort);
-            return Ok(());
-        }
+        // H3: any other result ends the procedure; only H4 resets SSNs. Like
+        // Denied, a bad sequence number for the outstanding RSN was not performed.
         let performed = matches!(
             response.result,
             ReconfigResult::SuccessPerformed | ReconfigResult::SuccessNop

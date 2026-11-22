@@ -98,6 +98,8 @@ fn test_reset_result_renumbers_only_released_messages() -> Result<()> {
             ReconfigResult::SuccessPerformed,
             ReconfigResult::SuccessNop,
             ReconfigResult::Denied,
+            ReconfigResult::ErrorBadSequenceNumber,
+            ReconfigResult::Unknown,
         ] {
             for initial_ssn in [3u16, u16::MAX] {
                 for queued in [false, true] {
@@ -124,10 +126,13 @@ fn test_reset_result_renumbers_only_released_messages() -> Result<()> {
                     receive_reset_response(&mut a, now, &reset, ReconfigResult::InProgress)?;
                     assert_eq!(0, data_chunks(&a.gather_outbound(now).0));
                     receive_reset_response(&mut a, now, &reset, result)?;
-                    let first_ssn = if result == ReconfigResult::Denied {
-                        initial_ssn.wrapping_add(1)
-                    } else {
+                    let first_ssn = if matches!(
+                        result,
+                        ReconfigResult::SuccessPerformed | ReconfigResult::SuccessNop
+                    ) {
                         0
+                    } else {
+                        initial_ssn.wrapping_add(1)
                     };
                     let chunks = transmitted_data(&a.gather_outbound(now).0);
                     if queued {
@@ -279,46 +284,48 @@ fn test_in_progress_reset_retries_without_exhausting_error_limit() -> Result<()>
 
 #[test]
 fn test_implicit_reset_ack_holds_next_request_until_result() -> Result<()> {
-    let mut a = timed_test_association();
-    let now = Instant::now();
-    let ppi = PayloadProtocolIdentifier::Binary;
-    a.open_stream(1, ppi)?.close(now)?;
-    let first = reset_requests(&a.gather_outbound(now).0).remove(0);
-    a.open_stream(2, ppi)?.close(now)?;
-    let implicit = ParamOutgoingResetRequest {
-        reconfig_request_sequence_number: 1,
-        reconfig_response_sequence_number: first.reconfig_request_sequence_number,
-        sender_last_tsn: a.peer_last_tsn.wrapping_add(1),
-        stream_identifiers: vec![1],
-    };
-    a.handle_reconfig(now, &reset_config(&implicit))?;
-    assert!(
-        a.timers.get(Timer::Reconfig).is_none(),
-        "E1 stops the timer"
-    );
-    assert!(a.streams.contains_key(&1), "receipt cannot finish RX reset");
-    assert!(
-        reset_requests(&a.gather_outbound(now).0).is_empty(),
-        "N+1 waits for N's result"
-    );
-    receive_reset_response(&mut a, now, &first, ReconfigResult::SuccessPerformed)?;
-    assert!(
-        reset_requests(&a.gather_outbound(now).0).is_empty(),
-        "H1 ignores result without timer"
-    );
-    let at = a.poll_timeout().unwrap();
-    a.handle_timeout(at);
-    assert_eq!(
-        vec![first.clone()],
-        reset_requests(&a.gather_outbound(at).0)
-    );
-    receive_reset_response(&mut a, at, &first, ReconfigResult::SuccessPerformed)?;
-    let next = reset_requests(&a.gather_outbound(at).0).remove(0);
-    assert_eq!(vec![2], next.stream_identifiers);
-    let timer = a.timers.get(Timer::Reconfig);
-    receive_reset_response(&mut a, at, &first, ReconfigResult::Denied)?;
-    assert_eq!(timer, a.timers.get(Timer::Reconfig));
-    assert_eq!(next, a.outgoing_reset.as_ref().unwrap().request);
+    for result_lost in [false, true] {
+        let mut a = timed_test_association();
+        let now = Instant::now();
+        let ppi = PayloadProtocolIdentifier::Binary;
+        a.open_stream(1, ppi)?.close(now)?;
+        let first = reset_requests(&a.gather_outbound(now).0).remove(0);
+        a.open_stream(2, ppi)?.close(now)?;
+        let implicit = ParamOutgoingResetRequest {
+            reconfig_request_sequence_number: 1,
+            reconfig_response_sequence_number: first.reconfig_request_sequence_number,
+            sender_last_tsn: a.peer_last_tsn.wrapping_add(1),
+            stream_identifiers: vec![1],
+        };
+        a.handle_reconfig(now, &reset_config(&implicit))?;
+        assert!(
+            a.timers.get(Timer::Reconfig).is_none(),
+            "E1 stops the timer"
+        );
+        assert!(a.streams.contains_key(&1), "receipt cannot finish RX reset");
+        assert!(
+            reset_requests(&a.gather_outbound(now).0).is_empty(),
+            "N+1 waits for N's result"
+        );
+        let mut at = now;
+        if result_lost {
+            // Without the explicit result, N is queried again unchanged.
+            at = a.poll_timeout().unwrap();
+            a.handle_timeout(at);
+            assert_eq!(
+                vec![first.clone()],
+                reset_requests(&a.gather_outbound(at).0)
+            );
+        }
+        // Receipt is not a result, but the result still belongs to N.
+        receive_reset_response(&mut a, at, &first, ReconfigResult::SuccessPerformed)?;
+        let next = reset_requests(&a.gather_outbound(at).0).remove(0);
+        assert_eq!(vec![2], next.stream_identifiers);
+        let timer = a.timers.get(Timer::Reconfig);
+        receive_reset_response(&mut a, at, &first, ReconfigResult::Denied)?;
+        assert_eq!(timer, a.timers.get(Timer::Reconfig));
+        assert_eq!(next, a.outgoing_reset.as_ref().unwrap().request);
+    }
     Ok(())
 }
 
@@ -520,7 +527,7 @@ fn test_reset_retry_exhaustion_closes_association_and_notifies_streams() -> Resu
 }
 
 #[test]
-fn test_unknown_reset_result_closes_instead_of_guessing_ssns() -> Result<()> {
+fn test_unsuccessful_reset_results_keep_association_and_ssns() -> Result<()> {
     for result in [
         ReconfigResult::ErrorBadSequenceNumber,
         ReconfigResult::Unknown,
@@ -528,31 +535,31 @@ fn test_unknown_reset_result_closes_instead_of_guessing_ssns() -> Result<()> {
         let mut a = timed_test_association();
         let now = Instant::now();
         let ppi = PayloadProtocolIdentifier::Binary;
-        a.open_stream(1, ppi)?.stop(now)?;
+        a.open_stream(1, ppi)?
+            .write_sctp(now, &Bytes::from_static(b"before"), ppi)?;
+        a.gather_outbound(now);
+        a.stream(1)?.stop(now)?;
         a.stream(1)?
-            .write_sctp(now, &Bytes::from_static(b"unknown SSN"), ppi)?;
+            .write_sctp(now, &Bytes::from_static(b"held"), ppi)?;
         let first = reset_requests(&a.gather_outbound(now).0).remove(0);
         while a.poll().is_some() {}
+        // RFC 6525 H3: the outstanding request was not performed.
         receive_reset_response(&mut a, now, &first, result)?;
-        assert!(a.is_closed());
-        assert!(a.poll_timeout().is_none());
+        assert_eq!(AssociationState::Established, a.state());
         assert!(a.outgoing_reset.is_none());
+        assert!(a.timers.get(Timer::Reconfig).is_none());
         let packets = a.gather_outbound(now).0;
-        assert!(transmitted_data(&packets).is_empty());
-        assert!(packets.iter().any(|p| {
+        assert!(!packets.iter().any(|p| {
             Packet::unmarshal(p)
                 .unwrap()
                 .chunks
                 .iter()
                 .any(|c| c.as_any().is::<ChunkAbort>())
         }));
-        assert!(matches!(
-            a.poll(),
-            Some(Event::AssociationLost {
-                id: 1,
-                reason: AssociationError::TransportError
-            })
-        ));
+        let data = transmitted_data(&packets);
+        assert_eq!(1, data.len());
+        assert_eq!(1, data[0].stream_sequence_number);
+        assert!(a.poll().is_none());
     }
     Ok(())
 }
@@ -1092,5 +1099,206 @@ fn test_duplicate_reset_with_changed_payload_never_reexecutes() -> Result<()> {
             assert_eq!(timer, a.timers.get(Timer::Reconfig));
         }
     }
+    Ok(())
+}
+
+fn responses(packets: &[Bytes]) -> Vec<ReconfigResult> {
+    let packets: Vec<Packet> = packets
+        .iter()
+        .map(|raw| Packet::unmarshal(raw).unwrap())
+        .collect();
+    reconfig_results(&packets)
+}
+
+#[test]
+fn test_deferred_reset_completed_by_data_resets_outgoing_stream_once() -> Result<()> {
+    for data_si in [1, 2] {
+        let mut a = timed_test_association();
+        let now = Instant::now();
+        let ppi = PayloadProtocolIdentifier::Binary;
+        a.open_stream(1, ppi)?;
+        a.open_stream(2, ppi)?;
+        let last_tsn = a.peer_last_tsn.wrapping_add(1);
+        let request = ParamOutgoingResetRequest {
+            reconfig_request_sequence_number: a.expected_reset_sequence(),
+            reconfig_response_sequence_number: a.my_next_rsn.wrapping_sub(1),
+            sender_last_tsn: last_tsn,
+            stream_identifiers: vec![1],
+        };
+        let reply = a.handle_reconfig(now, &reset_config(&request))?;
+        assert_eq!(vec![ReconfigResult::InProgress], reconfig_results(&reply));
+        assert!(reset_requests(&a.gather_outbound(now).0).is_empty());
+
+        let reply = a.handle_data(&ChunkPayloadData {
+            tsn: last_tsn,
+            stream_identifier: data_si,
+            beginning_fragment: true,
+            ending_fragment: true,
+            payload_type: ppi,
+            user_data: Bytes::from_static(b"before reset"),
+            ..Default::default()
+        })?;
+        if data_si == 1 {
+            // The application must collect the last message before E3.
+            assert!(reconfig_results(&reply).is_empty());
+            assert!(a.stream(1)?.read_sctp()?.is_some());
+            assert!(a.stream(1).is_err());
+        } else {
+            assert_eq!(
+                vec![ReconfigResult::SuccessPerformed],
+                reconfig_results(&reply)
+            );
+        }
+        let packets = a.gather_outbound(now).0;
+        if data_si == 1 {
+            assert_eq!(vec![ReconfigResult::SuccessPerformed], responses(&packets));
+        }
+        // RFC 8831 6.7: the peer's closed direction is answered by ours.
+        let reciprocal = reset_requests(&packets);
+        assert_eq!(1, reciprocal.len());
+        assert_eq!(vec![1], reciprocal[0].stream_identifiers);
+        let replay = a.handle_reconfig(now, &reset_config(&request))?;
+        assert_eq!(
+            vec![ReconfigResult::SuccessPerformed],
+            reconfig_results(&replay)
+        );
+        assert!(a.gather_outbound(now).0.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn test_reciprocal_reset_after_local_close_is_not_answered_again() -> Result<()> {
+    for response_first in [false, true] {
+        let mut a = timed_test_association();
+        let now = Instant::now();
+        let ppi = PayloadProtocolIdentifier::Binary;
+        a.open_stream(1, ppi)?.close(now)?;
+        let ours = reset_requests(&a.gather_outbound(now).0).remove(0);
+        if response_first {
+            receive_reset_response(&mut a, now, &ours, ReconfigResult::SuccessPerformed)?;
+        }
+        let reciprocal = ParamOutgoingResetRequest {
+            reconfig_request_sequence_number: a.expected_reset_sequence(),
+            reconfig_response_sequence_number: ours.reconfig_request_sequence_number,
+            sender_last_tsn: a.peer_last_tsn,
+            stream_identifiers: vec![1],
+        };
+        let reply = a.handle_reconfig(now, &reset_config(&reciprocal))?;
+        assert_eq!(
+            vec![ReconfigResult::SuccessPerformed],
+            reconfig_results(&reply)
+        );
+        if !response_first {
+            // The order of a peer that queues its request before the response.
+            receive_reset_response(&mut a, now, &ours, ReconfigResult::SuccessPerformed)?;
+        }
+        // Our direction was already reset by close(); a third request would
+        // only delay every later reset behind the serialized procedure.
+        assert!(reset_requests(&a.gather_outbound(now).0).is_empty());
+        assert!(a.outgoing_reset.is_none());
+        assert!(!a.pending_queue.is_resetting(1));
+        assert!(a.pending_queue.is_empty());
+        a.open_stream(2, ppi)?.close(now)?;
+        let next = reset_requests(&a.gather_outbound(now).0);
+        assert_eq!(1, next.len());
+        assert_eq!(vec![2], next[0].stream_identifiers);
+    }
+    Ok(())
+}
+
+#[test]
+fn test_deferred_reset_answers_only_requests_and_completion() -> Result<()> {
+    let mut a = timed_test_association();
+    let now = Instant::now();
+    let ppi = PayloadProtocolIdentifier::Binary;
+    a.open_stream(1, ppi)?;
+    a.open_stream(2, ppi)?;
+    let first_tsn = a.peer_last_tsn.wrapping_add(1);
+    let last_tsn = first_tsn.wrapping_add(9);
+    let request = ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: a.expected_reset_sequence(),
+        reconfig_response_sequence_number: a.my_next_rsn.wrapping_sub(1),
+        sender_last_tsn: last_tsn,
+        stream_identifiers: vec![1],
+    };
+    let reply = a.handle_reconfig(now, &reset_config(&request))?;
+    assert_eq!(vec![ReconfigResult::InProgress], reconfig_results(&reply));
+    for _ in 0..100 {
+        assert!(a.stream(1)?.read_sctp()?.is_none());
+    }
+    let mut results = vec![];
+    for offset in 0..10 {
+        let reply = a.handle_data(&ChunkPayloadData {
+            tsn: first_tsn.wrapping_add(offset),
+            stream_identifier: 2,
+            stream_sequence_number: offset as u16,
+            beginning_fragment: true,
+            ending_fragment: true,
+            payload_type: ppi,
+            user_data: Bytes::from_static(b"other stream"),
+            ..Default::default()
+        })?;
+        results.extend(reconfig_results(&reply));
+        if offset < 9 {
+            assert!(a.stream(1)?.read_sctp()?.is_none());
+        }
+    }
+    // E2 sends In progress on entry; E5/E6 report the completed reset once.
+    assert_eq!(vec![ReconfigResult::SuccessPerformed], results);
+    assert!(responses(&a.gather_outbound(now).0).is_empty());
+    // A retransmitted request is still answered.
+    let replay = a.handle_reconfig(now, &reset_config(&request))?;
+    assert_eq!(
+        vec![ReconfigResult::SuccessPerformed],
+        reconfig_results(&replay)
+    );
+    Ok(())
+}
+
+#[test]
+fn test_acknowledged_data_keeps_unanswered_reset_from_closing_association() -> Result<()> {
+    let mut a = timed_test_association();
+    let mut now = Instant::now();
+    let ppi = PayloadProtocolIdentifier::Binary;
+    a.open_stream(1, ppi)?.close(now)?;
+    a.open_stream(2, ppi)?;
+    let request = reset_requests(&a.gather_outbound(now).0).remove(0);
+    let mut retransmissions = 0;
+    // Far beyond the 63 s retry budget of an idle association.
+    while retransmissions < 12 {
+        a.stream(2)?
+            .write_sctp(now, &Bytes::from_static(b"other stream"), ppi)?;
+        let data = transmitted_data(&a.gather_outbound(now).0);
+        assert_eq!(1, data.len());
+        // RFC 9260 8.1: acknowledged DATA clears the association error count.
+        a.handle_sack(
+            &ChunkSelectiveAck {
+                cumulative_tsn_ack: data[0].tsn,
+                advertised_receiver_window_credit: 65536,
+                ..Default::default()
+            },
+            now,
+        )?;
+        now = a.timers.get(Timer::Reconfig).unwrap();
+        a.handle_timeout(now);
+        assert_eq!(AssociationState::Established, a.state());
+        assert_eq!(
+            vec![request.clone()],
+            reset_requests(&a.gather_outbound(now).0)
+        );
+        retransmissions += 1;
+    }
+    // Without acknowledged DATA, the same limit still ends the association:
+    // the last expiration above already counts against it.
+    let mut expirations = 0;
+    while let Some(at) = a.timers.get(Timer::Reconfig) {
+        a.handle_timeout(at);
+        a.gather_outbound(at);
+        expirations += 1;
+        assert!(expirations <= 5);
+    }
+    assert_eq!(5, expirations);
+    assert!(a.is_closed());
     Ok(())
 }

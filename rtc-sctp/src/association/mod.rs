@@ -872,9 +872,10 @@ impl Association {
     /// `stream_identifier` still had data the application had not collected
     /// Called when that stream drains.
     ///
-    /// The reply is queued like any other control packet; a request naming
-    /// several streams retains only its unfinished selection, so retries cannot
-    /// reset a completed SID that the application has already reused.
+    /// Only a completed request is answered here, so empty reads cannot repeat
+    /// In progress. A request naming several streams retains only its
+    /// unfinished selection, so retries cannot reset a completed SID that the
+    /// application has already reused.
     pub(crate) fn retry_deferred_resets(&mut self, stream_identifier: StreamId) {
         let pending: Vec<u32> = self
             .reconfig_requests
@@ -888,7 +889,7 @@ impl Association {
 
         let mut reply = vec![];
         for sequence in pending {
-            if let Err(err) = self.reset_streams_if_any(sequence, true, &mut reply) {
+            if let Err(err) = self.reset_streams_if_any(sequence, false, &mut reply) {
                 self.fail_message_queue(err);
                 return;
             }
@@ -1105,12 +1106,7 @@ impl Association {
             i.initial_tsn - 1
         };
         self.peer_last_rsn = i.initial_tsn.wrapping_sub(1);
-        self.peer_supports_reconfig = i.params.iter().any(|param| {
-            param
-                .as_any()
-                .downcast_ref::<ParamSupportedExtensions>()
-                .is_some_and(|extensions| extensions.chunk_types.contains(&CT_RECONFIG))
-        });
+        self.peer_supports_reconfig = false;
 
         // Adopt the peer's advertised receive window and seed ssthresh from it,
         // mirroring handle_init_ack (and Pion's shared init path). RFC 4960
@@ -1128,6 +1124,8 @@ impl Association {
                     if *t == CT_FORWARD_TSN {
                         debug!("[{}] use ForwardTSN (on init)", self.side);
                         self.use_forward_tsn = true;
+                    } else if *t == CT_RECONFIG {
+                        self.peer_supports_reconfig = true;
                     }
                 }
             }
@@ -1199,12 +1197,7 @@ impl Association {
             i.initial_tsn - 1
         };
         self.peer_last_rsn = i.initial_tsn.wrapping_sub(1);
-        self.peer_supports_reconfig = i.params.iter().any(|param| {
-            param
-                .as_any()
-                .downcast_ref::<ParamSupportedExtensions>()
-                .is_some_and(|extensions| extensions.chunk_types.contains(&CT_RECONFIG))
-        });
+        self.peer_supports_reconfig = false;
         if self.source_port != p.common_header.destination_port
             || self.destination_port != p.common_header.source_port
         {
@@ -1240,6 +1233,8 @@ impl Association {
                     if *t == CT_FORWARD_TSN {
                         debug!("[{}] use ForwardTSN (on initAck)", self.side);
                         self.use_forward_tsn = true;
+                    } else if *t == CT_RECONFIG {
+                        self.peer_supports_reconfig = true;
                     }
                 }
             } else if param
@@ -1938,8 +1933,11 @@ impl Association {
         // counter, including a late SACK after local abandonment. Payload
         // release does not acknowledge DATA; duplicates and never-sent TSNs
         // assigned only for FORWARD TSN do not count as newly acknowledged DATA.
+        // RFC 6525 5.1.1 counts RE-CONFIG expirations against the same
+        // association limit, so a reset still pending cannot outlive this.
         if newly_acked_data {
             self.timers.reset_retrans(Timer::T3RTX);
+            self.timers.reset_retrans(Timer::Reconfig);
         }
         if earliest_outstanding.is_some_and(|tsn| {
             sna32lte(tsn, d.cumulative_tsn_ack)
@@ -2137,10 +2135,25 @@ impl Association {
             .collect()
     }
 
+    /// RFC 8831 6.7: a reset incoming direction is answered by resetting the
+    /// outgoing one, unless `stop()` or an earlier boundary already did.
+    fn needs_reciprocal_reset(&self, id: StreamId) -> bool {
+        self.peer_supports_reconfig
+            && self.streams.get(&id).is_some_and(|s| {
+                matches!(
+                    s.state,
+                    RecvSendState::Readable | RecvSendState::ReadWritable
+                )
+            })
+            && !self.pending_queue.is_resetting(id)
+    }
+
+    /// `answer` is set when replying to a received request. Re-evaluation after
+    /// DATA or an application read reports only completion (RFC 6525 E2, E5).
     fn reset_streams_if_any(
         &mut self,
         sequence: u32,
-        respond: bool,
+        answer: bool,
         reply: &mut Vec<Packet>,
     ) -> Result<()> {
         let Some(reset) = self.reconfig_requests.get(&sequence) else {
@@ -2159,35 +2172,22 @@ impl Association {
             let draining = self.streams_awaiting_drain(&streams);
             // Queueing a reciprocal boundary can fail. Validate the whole
             // group before unregistering any API stream or changing a gate.
-            let reset_count = if respond && self.peer_supports_reconfig {
-                streams
-                    .iter()
-                    .filter(|id| {
-                        !draining.contains(id)
-                            && self.streams.contains_key(id)
-                            && !self.pending_queue.is_resetting(**id)
-                    })
-                    .count() as u64
-            } else {
-                0
-            };
+            let reset_count = streams
+                .iter()
+                .filter(|id| !draining.contains(id) && self.needs_reciprocal_reset(**id))
+                .count() as u64;
             self.pending_queue.check_reset_capacity(reset_count)?;
 
             for id in &streams {
                 if draining.contains(id) {
                     continue;
                 }
-                if self.streams.contains_key(id) {
-                    if respond
-                        && self.peer_supports_reconfig
-                        && !self.pending_queue.is_resetting(*id)
-                    {
-                        self.pending_queue.push_reset(ResetMarker {
-                            stream_identifier: *id,
-                        })?;
-                    }
-                    self.unregister_stream(*id, AssociationError::Reset);
+                if self.needs_reciprocal_reset(*id) {
+                    self.pending_queue.push_reset(ResetMarker {
+                        stream_identifier: *id,
+                    })?;
                 }
+                self.unregister_stream(*id, AssociationError::Reset);
             }
 
             if draining.is_empty() {
@@ -2210,11 +2210,11 @@ impl Association {
             result = ReconfigResult::InProgress;
         }
 
-        let packet = self.reconfig_response_packet(sequence, result);
-
-        debug!("[{}] RESET RESPONSE: {}", self.side, packet);
-
-        reply.push(packet);
+        if answer || result != ReconfigResult::InProgress {
+            let packet = self.reconfig_response_packet(sequence, result);
+            debug!("[{}] RESET RESPONSE: {}", self.side, packet);
+            reply.push(packet);
+        }
 
         Ok(())
     }
@@ -3064,18 +3064,19 @@ impl Association {
                     break; // no more rwnd
                 }
 
-                if let Some(chunk) = self.move_pending_data_chunk_to_inflight_queue(
+                match self.move_pending_data_chunk_to_inflight_queue(
                     beginning_fragment,
                     unordered,
                     now,
                 ) {
-                    self.rwnd -= data_len as u32;
-                    chunks.push(chunk);
-                } else {
-                    self.fail_message_queue(Error::OtherSctpErr(
-                        "failed to pop pending DATA".into(),
-                    ));
-                    return (vec![], vec![]);
+                    Ok(chunk) => {
+                        self.rwnd -= data_len as u32;
+                        chunks.push(chunk);
+                    }
+                    Err(err) => {
+                        self.fail_message_queue(err);
+                        return (vec![], vec![]);
+                    }
                 }
             }
 
@@ -3085,17 +3086,16 @@ impl Association {
                 if let Some(c) = self.pending_queue.peek() {
                     let (beginning_fragment, unordered) = (c.beginning_fragment, c.unordered);
 
-                    if let Some(chunk) = self.move_pending_data_chunk_to_inflight_queue(
+                    match self.move_pending_data_chunk_to_inflight_queue(
                         beginning_fragment,
                         unordered,
                         now,
                     ) {
-                        chunks.push(chunk);
-                    } else {
-                        self.fail_message_queue(Error::OtherSctpErr(
-                            "failed to pop pending DATA".into(),
-                        ));
-                        return (vec![], vec![]);
+                        Ok(chunk) => chunks.push(chunk),
+                        Err(err) => {
+                            self.fail_message_queue(err);
+                            return (vec![], vec![]);
+                        }
                     }
                 }
             }
@@ -3293,12 +3293,15 @@ impl Association {
         beginning_fragment: bool,
         unordered: bool,
         now: Instant,
-    ) -> Option<ChunkPayloadData> {
-        let first = self.pending_queue.peek()?;
+    ) -> Result<ChunkPayloadData> {
+        let first = self
+            .pending_queue
+            .peek()
+            .ok_or_else(|| Error::OtherSctpErr("missing pending DATA".into()))?;
         let si = first.stream_identifier;
         let slot = self.transmit_streams.get_mut(&si);
         let mut tx = slot.as_deref().copied().unwrap_or_default();
-        let ssn = tx.assign_ssn(first).ok()?;
+        let ssn = tx.assign_ssn(first)?;
         if let Some(mut c) = self.pending_queue.pop(beginning_fragment, unordered) {
             if let Some(slot) = slot {
                 *slot = tx;
@@ -3326,10 +3329,9 @@ impl Association {
 
             self.inflight_queue.push_no_check(c.clone());
 
-            Some(c)
+            Ok(c)
         } else {
-            error!("[{}] failed to pop from pending queue", self.side);
-            None
+            Err(Error::OtherSctpErr("failed to pop pending DATA".into()))
         }
     }
 
